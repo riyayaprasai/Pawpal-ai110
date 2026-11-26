@@ -1,8 +1,12 @@
 """PawPal+ domain entities and owner-wide scheduling."""
 
+import json
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from itertools import combinations
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from threading import Lock
 from typing import Literal, get_args
 from uuid import UUID, uuid4
@@ -11,7 +15,10 @@ Frequency = Literal["once", "daily", "weekly"]
 Priority = Literal["Low", "Medium", "High"]
 TaskData = dict[str, str | int | bool]
 
+DEFAULT_DATA_PATH = Path(__file__).resolve().parent / "data" / "data.json"
+
 _completion_lock = Lock()
+_persistence_lock = Lock()
 
 
 def _require_nonblank(value: str, field_name: str) -> None:
@@ -177,12 +184,15 @@ TaskConflict = tuple[PetTask, PetTask]
 PlannedTask = tuple[PetTask, datetime, str]  # Pair, proposed start, explanation.
 
 
-def _due_time_key(entry: PetTask) -> datetime:
+def _datetime_key(value: datetime) -> datetime:
     """Use an absolute clock for aware datetimes and preserve local naive times."""
-    due_at = entry[1].due_at
-    if due_at.utcoffset() is not None:
-        return due_at.astimezone(timezone.utc)
-    return due_at
+    if value.utcoffset() is not None:
+        return value.astimezone(timezone.utc)
+    return value
+
+
+def _due_time_key(entry: PetTask) -> datetime:
+    return _datetime_key(entry[1].due_at)
 
 
 class Scheduler:
@@ -196,6 +206,13 @@ class Scheduler:
     def sort_by_time(self) -> list[PetTask]:
         """Return pet-task pairs by due time, preserving insertion order for ties."""
         return sorted(self.owner.get_all_tasks(), key=_due_time_key)
+
+    def sort_by_priority(self, entries: Iterable[PetTask] | None = None) -> list[PetTask]:
+        """Order High, Medium, then Low, with earlier tasks first within each group."""
+        ranks = {"High": 0, "Medium": 1, "Low": 2}
+        if entries is None:
+            entries = self.owner.get_all_tasks()
+        return sorted(entries, key=lambda entry: (ranks[entry[1].priority], _due_time_key(entry)))
 
     def sort_chronologically(self) -> list[PetTask]:
         """Return the chronological schedule through the original method name."""
@@ -276,9 +293,163 @@ class Scheduler:
     def find_next_available_slot(
         self, window_start: datetime, window_end: datetime, duration_minutes: int
     ) -> datetime | None:
-        """Return the earliest start that fits inside the window, or None.
+        """Return the earliest fitting start within the window, or None."""
+        if type(duration_minutes) is not int:
+            raise TypeError("Duration must be a whole number of minutes.")
+        if duration_minutes <= 0:
+            raise ValueError("Duration must be positive.")
+        if not isinstance(window_start, datetime) or not isinstance(window_end, datetime):
+            raise TypeError("The window start and end must be datetimes.")
 
-        Consider pending tasks across all pets, including overlaps from
-        tasks that start before the window.
-        """
-        raise NotImplementedError
+        start, end = _datetime_key(window_start), _datetime_key(window_end)
+        if start.tzinfo != end.tzinfo:
+            raise ValueError("The window start and end must use compatible time zones.")
+        if start >= end:
+            raise ValueError("The latest end must be after the earliest start.")
+
+        minute = timedelta(minutes=1)
+        if duration_minutes > (end - start) // minute:
+            return None
+        duration = timedelta(minutes=duration_minutes)
+
+        occupied = []
+        for _, task in self.owner.get_all_tasks():
+            if task.completed:
+                continue
+            task_start = _datetime_key(task.due_at)
+            if task_start.tzinfo != start.tzinfo:
+                raise ValueError("The search window and pending tasks must use compatible time zones.")
+            if task_start >= end:
+                continue
+
+            # Cap the occupied end before adding a duration that may exceed datetime's range.
+            if task.duration_minutes > (end - task_start) // minute:
+                task_end = end
+            else:
+                task_end = task_start + timedelta(minutes=task.duration_minutes)
+            if task_end > start:
+                occupied.append((task_start, task_end))
+
+        candidate = start
+        for task_start, task_end in sorted(occupied):
+            if task_start - candidate >= duration:
+                break
+            candidate = max(candidate, task_end)
+
+        if end - candidate < duration:
+            return None
+        if start.tzinfo is not None:
+            return candidate.astimezone(window_start.tzinfo)
+        return candidate
+
+
+def _object(value: object, label: str) -> dict:
+    """Require a JSON object at the current location."""
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be an object")
+    return value
+
+
+def _array(value: object, label: str) -> list:
+    """Require a JSON array at the current location."""
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be an array")
+    return value
+
+
+def _restore_owner(data: object) -> Owner:
+    """Rebuild and validate the owner, pets, and tasks in a saved document."""
+    owner_data = _object(data, "Owner")
+    pets = []
+    for pet_data in _array(owner_data["pets"], "Pets"):
+        pet_data = _object(pet_data, "Pet")
+        tasks = []
+        for task_data in _array(pet_data["tasks"], "Tasks"):
+            task_data = _object(task_data, "Task")
+            tasks.append(
+                Task(
+                    task_id=UUID(task_data["task_id"]),
+                    description=task_data["description"],
+                    due_at=datetime.fromisoformat(task_data["due_at"]),
+                    completed=task_data["completed"],
+                    frequency=task_data["frequency"],
+                    priority=task_data["priority"],
+                    duration_minutes=task_data["duration_minutes"],
+                )
+            )
+        pets.append(
+            Pet(
+                pet_id=UUID(pet_data["pet_id"]),
+                name=pet_data["name"],
+                species=pet_data["species"],
+                tasks=tasks,
+            )
+        )
+    return Owner(owner_id=UUID(owner_data["owner_id"]), name=owner_data["name"], pets=pets)
+
+
+def load_from_json(path: str | Path = DEFAULT_DATA_PATH) -> Owner | None:
+    """Load an owner from disk, or return None when the file is missing."""
+    path = Path(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except UnicodeError as error:
+        raise ValueError(f"Invalid UTF-8 in {path}.") from error
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Malformed JSON in {path}: {error}") from error
+    try:
+        return _restore_owner(data)
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"Invalid PawPal+ data in {path}: {error}") from error
+
+
+def save_to_json(
+    owner: Owner,
+    path: str | Path = DEFAULT_DATA_PATH,
+    *,
+    expected_owner: Owner | None = None,
+) -> None:
+    """Replace a valid saved owner atomically, optionally checking for stale data."""
+    path = Path(path)
+    data = {
+        "owner_id": str(owner.owner_id),
+        "name": owner.name,
+        "pets": [
+            {
+                "pet_id": str(pet.pet_id),
+                "name": pet.name,
+                "species": pet.species,
+                "tasks": [task.to_dict() for task in pet.list_tasks()],
+            }
+            for pet in owner.list_pets()
+        ],
+    }
+    try:
+        _restore_owner(data)
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"Cannot save invalid PawPal+ data: {error}") from error
+
+    with _persistence_lock:
+        stored_owner = load_from_json(path)
+        if expected_owner is not None and stored_owner is not None and stored_owner != expected_owner:
+            raise ValueError("The saved data changed in another session. Reopen PawPal+ and try again.")
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = None
+        try:
+            with NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=path.parent,
+                prefix=f".{path.name}.", suffix=".tmp", delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                json.dump(data, temporary_file, ensure_ascii=False, indent=2)
+                temporary_file.write("\n")
+            temporary_path.replace(path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)

@@ -1,6 +1,7 @@
 """Streamlit interface for the PawPal+ pet care tracker."""
 
 from collections import Counter
+from copy import deepcopy
 from datetime import date, datetime, time
 from html import escape
 from pathlib import Path
@@ -9,34 +10,53 @@ from uuid import UUID
 
 import streamlit as st
 
-from pawpal_system import Frequency, Owner, Pet, PetTask, Priority, Scheduler, Task
+from pawpal_system import (
+    DEFAULT_DATA_PATH, Frequency, Owner, Pet, PetTask, Priority, Scheduler, Task,
+    load_from_json, save_to_json,
+)
 
 APP_CSS = Path(__file__).resolve().parent / "assets" / "pawpal.css"
+PRIORITY_LABELS = {"High": "▲ High", "Medium": "● Medium", "Low": "▼ Low"}
+
+
+def persist_owner(candidate: Owner, message: str) -> bool:
+    """Publish a changed snapshot only after its save succeeds."""
+    try:
+        save_to_json(candidate, DEFAULT_DATA_PATH, expected_owner=st.session_state["owner"])
+    except (OSError, ValueError) as error:
+        st.session_state["notice"] = (False, f"Change could not be saved. {error}")
+        return False
+
+    st.session_state["owner"] = candidate
+    st.session_state["notice"] = (True, message)
+    return True
 
 
 def save_owner_name(owner: Owner) -> None:
     """Save the sidebar name on the existing owner."""
+    candidate = deepcopy(owner)
     try:
-        owner.rename(st.session_state["owner_name"].strip())
+        candidate.rename(st.session_state["owner_name"].strip())
     except ValueError as error:
         st.session_state["notice"] = (False, str(error))
     else:
-        st.session_state["notice"] = (True, "Owner name saved.")
+        persist_owner(candidate, "Owner name saved.")
 
 
 def add_pet(owner: Owner) -> None:
     """Create and register a pet using the submitted details."""
+    candidate = deepcopy(owner)
     try:
         pet = Pet(
             name=st.session_state["pet_name"].strip(),
             species=st.session_state["pet_species"],
         )
-        owner.add_pet(pet)
+        candidate.add_pet(pet)
     except ValueError as error:
         st.session_state["notice"] = (False, str(error))
     else:
-        st.session_state["pet_name"] = ""
-        st.session_state["notice"] = (True, f"Added {pet.name}.")
+        if persist_owner(candidate, f"Added {pet.name}."):
+            st.session_state["pet_name"] = ""
 
 
 def remove_pet(owner: Owner, pet_id: UUID, confirmation_key: str) -> None:
@@ -45,21 +65,25 @@ def remove_pet(owner: Owner, pet_id: UUID, confirmation_key: str) -> None:
         st.session_state["notice"] = (False, "Check the confirmation box before removing a pet.")
         return
 
-    pet = owner.remove_pet(pet_id)
+    candidate = deepcopy(owner)
+    pet = candidate.remove_pet(pet_id)
     if pet is None:
         st.session_state["notice"] = (False, "This pet is no longer registered.")
+        return
+
+    if not persist_owner(candidate, f"Removed {pet.name} and their tasks."):
         return
 
     st.session_state["remove_pet_id"] = None
     for selection_key in ("task_pet_id", "schedule_pet_id"):
         if st.session_state.get(selection_key) == pet_id:
             st.session_state[selection_key] = None
-    st.session_state["notice"] = (True, f"Removed {pet.name} and their tasks.")
 
 
 def add_task(owner: Owner, pet_id: UUID) -> None:
     """Validate and add a task to the selected registered pet."""
-    pet = owner.find_pet(pet_id)
+    candidate = deepcopy(owner)
+    pet = candidate.find_pet(pet_id)
     if pet is None:
         st.session_state["notice"] = (False, "Select a registered pet before adding a task.")
         return
@@ -76,19 +100,20 @@ def add_task(owner: Owner, pet_id: UUID) -> None:
     except (TypeError, ValueError) as error:
         st.session_state["notice"] = (False, str(error))
     else:
-        st.session_state["task_description"] = ""
-        st.session_state["notice"] = (True, f"Added a task for {pet.name}.")
+        if persist_owner(candidate, f"Added a task for {pet.name}."):
+            st.session_state["task_description"] = ""
 
 
-def complete_task(scheduler: Scheduler, pet_id: UUID, selection_key: str) -> None:
+def complete_task(owner: Owner, pet_id: UUID, selection_key: str) -> None:
     """Complete the selected occurrence through the scheduler."""
     task_id = st.session_state[selection_key]
     if task_id is None:
         st.session_state["notice"] = (False, "Choose a pending task to mark complete.")
         return
 
+    candidate = deepcopy(owner)
     try:
-        next_task = scheduler.mark_task_complete(pet_id, task_id)
+        next_task = Scheduler(candidate).mark_task_complete(pet_id, task_id)
     except ValueError as error:
         st.session_state["notice"] = (False, str(error))
         return
@@ -96,11 +121,11 @@ def complete_task(scheduler: Scheduler, pet_id: UUID, selection_key: str) -> Non
         st.session_state["notice"] = (False, "The next occurrence is outside the supported date range.")
         return
 
-    st.session_state[selection_key] = None
     message = "Task marked complete."
     if next_task is not None:
         message += f" Next occurrence: {next_task.due_at:%b %d, %Y at %H:%M}."
-    st.session_state["notice"] = (True, message)
+    if persist_owner(candidate, message):
+        st.session_state[selection_key] = None
 
 
 def pet_labels(pets: list[Pet]) -> dict[UUID, str]:
@@ -125,7 +150,7 @@ def show_task_table(
             "Pet": labels[pet.pet_id],
             "Task": task.description,
             "Due": task.due_at.strftime("%b %d, %Y · %H:%M"),
-            "Priority": task.priority,
+            "Priority": PRIORITY_LABELS[task.priority],
             "Status": "Completed" if task.completed else "Pending",
         }
         if details:
@@ -248,7 +273,7 @@ def show_tasks(owner: Owner, scheduler: Scheduler, labels: dict[UUID, str], toda
             key=selection_key,
         )
         st.form_submit_button(
-            "Mark complete", on_click=complete_task, args=(scheduler, pet_id, selection_key)
+            "Mark complete", on_click=complete_task, args=(owner, pet_id, selection_key)
         )
 
 
@@ -256,15 +281,18 @@ def show_schedule(scheduler: Scheduler, labels: dict[UUID, str]) -> None:
     """Render filtered rows and warn about conflicts across the full schedule."""
     with st.container(border=True):
         st.header("Scheduled tasks")
-        pet_column, status_column = st.columns(2)
+        pet_column, status_column, sort_column = st.columns(3)
         pet_id = pet_column.selectbox(
             "Filter by pet", list(labels), index=None, format_func=labels.__getitem__,
             placeholder="All pets", disabled=not labels, key="schedule_pet_id",
         )
         statuses = {"All statuses": None, "Pending": False, "Completed": True}
         status = status_column.selectbox("Completion status", list(statuses))
+        order = sort_column.selectbox("Sort by", ("Chronological", "Priority"), key="schedule_sort")
 
         entries = scheduler.filter_tasks(pet_id=pet_id, completed=statuses[status])
+        if order == "Priority":
+            entries = scheduler.sort_by_priority(entries)
         if entries:
             show_task_table(entries, labels)
         elif pet_id is None and status == "All statuses":
@@ -284,12 +312,47 @@ def show_schedule(scheduler: Scheduler, labels: dict[UUID, str]) -> None:
                 )
 
 
+def show_slot_suggestion(scheduler: Scheduler, today: date) -> None:
+    """Suggest a free interval without changing any tasks."""
+    with st.expander("Find an available slot"):
+        with st.form("find_slot"):
+            start_date_col, start_time_col = st.columns(2)
+            start_date = start_date_col.date_input("Earliest start date", value=today)
+            start_time = start_time_col.time_input("Earliest start time", value=time(8))
+            end_date_col, end_time_col = st.columns(2)
+            end_date = end_date_col.date_input("Latest end date", value=today)
+            end_time = end_time_col.time_input("Latest end time", value=time(18))
+            minutes = st.number_input("Requested duration (minutes)", min_value=1, value=30, step=1)
+            submitted = st.form_submit_button("Find slot", type="primary")
+        if not submitted:
+            return
+
+        try:
+            start = datetime.combine(start_date, start_time)
+            end = datetime.combine(end_date, end_time)
+            slot = scheduler.find_next_available_slot(start, end, minutes)
+        except (TypeError, ValueError) as error:
+            st.warning(str(error))
+            return
+
+        if slot is None:
+            st.info("No available slot fits that duration and time window.")
+        else:
+            st.success(f"Earliest available start: {slot:%b %d, %Y at %H:%M} ({minutes} min).")
+
+
 def main() -> None:
     """Render the dashboard and management views for this session."""
     st.set_page_config(page_title="PawPal+", page_icon="🐾", layout="wide")
     st.markdown(f"<style>{APP_CSS.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
     if "owner" not in st.session_state:
-        st.session_state["owner"] = Owner("Jordan")
+        try:
+            loaded_owner = load_from_json(DEFAULT_DATA_PATH)
+        except (OSError, ValueError) as error:
+            st.error(f"PawPal+ could not open saved data. {error}")
+            st.info("Restore a valid data file and reopen PawPal+.")
+            st.stop()
+        st.session_state["owner"] = loaded_owner if loaded_owner is not None else Owner("Jordan")
     owner: Owner = st.session_state["owner"]
 
     with st.sidebar:
@@ -297,7 +360,7 @@ def main() -> None:
         with st.form("owner_profile"):
             st.text_input("Owner name", value=owner.name, key="owner_name")
             st.form_submit_button("Save name", on_click=save_owner_name, args=(owner,))
-        st.caption("Pets and tasks are kept in this browser session.")
+        st.caption("Changes are saved to the local PawPal+ data file.")
 
     st.markdown(
         """
@@ -337,6 +400,7 @@ def main() -> None:
         show_tasks(owner, scheduler, labels, today)
     with schedule:
         show_schedule(scheduler, labels)
+        show_slot_suggestion(scheduler, today)
 
 
 if __name__ == "__main__":

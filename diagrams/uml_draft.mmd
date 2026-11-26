@@ -38,6 +38,7 @@ classDiagram
         +Owner owner
         +__init__(Owner owner) None
         +sort_by_time() list~PetTask~
+        +sort_by_priority(Optional~Iterable~PetTask~~ entries) list~PetTask~
         +sort_chronologically() list~PetTask~
         +filter_tasks(Optional~UUID~ pet_id, Optional~str~ pet_name, Optional~date~ due_on, Optional~bool~ completed, Optional~Priority~ priority) list~PetTask~
         +detect_conflicts() list~TaskConflict~
