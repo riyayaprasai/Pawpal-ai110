@@ -7,6 +7,18 @@
 - Briefly describe your initial UML design.
 - What classes did you include, and what responsibilities did you assign to each?
 
+**Proposed architecture**
+
+- `Task`, `Pet`, and `Owner` are dataclasses. Each pet holds its own tasks and each owner holds their pets. `Owner.get_all_tasks()` keeps each task paired with its pet.
+- `Scheduler` reads one owner's tasks across all pets. It can sort, filter, check for overlaps, and propose a plan with reasons for its choices. Streamlit can display those results and collect input separately.
+- The draft uses the due time as the current scheduled start for overlap checks. Review whether fixed appointments need a separate start or deadline and which time zone defines the owner's calendar day.
+
+**Three core workflows**
+
+1. **Set up pets and care tasks.** Create an owner, add pets, and assign feeding, walking, medication, grooming, or appointment tasks to the relevant pet. Each task records its due time, duration, frequency, and priority.
+2. **Review and plan a day.** Filter the combined schedule by pet, date, or completion status. Check for overlaps across pets, then propose a priority-based plan or look for a slot that fits within the owner's available time.
+3. **Complete a task and handle recurrence.** Mark the current task complete. For a daily or weekly task, use its scheduled due time to preview the next occurrence. A future implementation can add that occurrence to the same pet as a separate task and prevent duplicates when completion is retried.
+
 **b. Design changes**
 
 - Did your design change during implementation?

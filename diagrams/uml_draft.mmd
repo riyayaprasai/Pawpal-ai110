@@ -1,0 +1,52 @@
+classDiagram
+    class Task {
+        +str description
+        +datetime due_at
+        +int duration_minutes
+        +UUID task_id
+        +bool completed
+        +Frequency frequency
+        +Priority priority
+        +mark_complete() None
+        +to_dict() TaskData
+    }
+
+    class Pet {
+        +str name
+        +str species
+        +UUID pet_id
+        +list~Task~ tasks
+        +add_task(Task task) None
+        +list_tasks() list~Task~
+        +find_task(UUID task_id) Optional~Task~
+        +remove_task(UUID task_id) Optional~Task~
+    }
+
+    class Owner {
+        +str name
+        +UUID owner_id
+        +list~Pet~ pets
+        +add_pet(Pet pet) None
+        +find_pet(UUID pet_id) Optional~Pet~
+        +list_pets() list~Pet~
+        +remove_pet(UUID pet_id) Optional~Pet~
+        +get_all_tasks() list~PetTask~
+    }
+
+    class Scheduler {
+        +Owner owner
+        +__init__(Owner owner) None
+        +sort_chronologically() list~PetTask~
+        +filter_tasks(Optional~UUID~ pet_id, Optional~date~ due_on, Optional~bool~ completed) list~PetTask~
+        +detect_conflicts() list~TaskConflict~
+        +next_occurrence_at(Task task) Optional~datetime~
+        +plan_by_priority(datetime window_start, datetime window_end) list~PlannedTask~
+        +find_next_available_slot(datetime window_start, datetime window_end, int duration_minutes) Optional~datetime~
+    }
+
+    Owner "1" *-- "0..*" Pet : contains
+    Pet "1" *-- "0..*" Task : contains
+    Scheduler "0..*" --> "1" Owner : references
+
+    note for Task "Frequency is once, daily, or weekly.<br>Priority is Low, Medium, or High.<br>TaskData is a JSON-ready mapping."
+    note for Scheduler "PetTask pairs a pet with its task.<br>TaskConflict pairs two PetTask entries.<br>PlannedTask contains a PetTask, proposed start, and explanation."
