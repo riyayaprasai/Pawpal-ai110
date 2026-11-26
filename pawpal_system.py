@@ -357,6 +357,16 @@ def _array(value: object, label: str) -> list:
     return value
 
 
+def _unique_json_fields(fields: list[tuple[str, object]]) -> dict[str, object]:
+    """Reject ambiguous objects before a later value can erase an earlier one."""
+    result: dict[str, object] = {}
+    for key, value in fields:
+        if key in result:
+            raise ValueError(f"Duplicate JSON field: {key}")
+        result[key] = value
+    return result
+
+
 def _restore_owner(data: object) -> Owner:
     """Rebuild and validate the owner, pets, and tasks in a saved document."""
     owner_data = _object(data, "Owner")
@@ -366,11 +376,14 @@ def _restore_owner(data: object) -> Owner:
         tasks = []
         for task_data in _array(pet_data["tasks"], "Tasks"):
             task_data = _object(task_data, "Task")
+            due_at = task_data["due_at"]
+            if not isinstance(due_at, str) or ("T" not in due_at and " " not in due_at):
+                raise ValueError("due_at must contain an ISO datetime with a time")
             tasks.append(
                 Task(
                     task_id=UUID(task_data["task_id"]),
                     description=task_data["description"],
-                    due_at=datetime.fromisoformat(task_data["due_at"]),
+                    due_at=datetime.fromisoformat(due_at),
                     completed=task_data["completed"],
                     frequency=task_data["frequency"],
                     priority=task_data["priority"],
@@ -388,6 +401,11 @@ def _restore_owner(data: object) -> Owner:
     return Owner(owner_id=UUID(owner_data["owner_id"]), name=owner_data["name"], pets=pets)
 
 
+def _reject_json_constant(token: str) -> None:
+    """Reject non-finite literals that the default JSON decoder accepts."""
+    raise ValueError(f"Invalid JSON numeric literal: {token}")
+
+
 def load_from_json(path: str | Path = DEFAULT_DATA_PATH) -> Owner | None:
     """Load an owner from disk, or return None when the file is missing."""
     path = Path(path)
@@ -399,8 +417,12 @@ def load_from_json(path: str | Path = DEFAULT_DATA_PATH) -> Owner | None:
         raise ValueError(f"Invalid UTF-8 in {path}.") from error
 
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError as error:
+        data = json.loads(
+            text,
+            object_pairs_hook=_unique_json_fields,
+            parse_constant=_reject_json_constant,
+        )
+    except ValueError as error:
         raise ValueError(f"Malformed JSON in {path}: {error}") from error
     try:
         return _restore_owner(data)
@@ -408,15 +430,16 @@ def load_from_json(path: str | Path = DEFAULT_DATA_PATH) -> Owner | None:
         raise ValueError(f"Invalid PawPal+ data in {path}: {error}") from error
 
 
-def save_to_json(
-    owner: Owner,
-    path: str | Path = DEFAULT_DATA_PATH,
-    *,
-    expected_owner: Owner | None = None,
-) -> None:
-    """Replace a valid saved owner atomically, optionally checking for stale data."""
-    path = Path(path)
-    data = {
+class _UncheckedSnapshot:
+    """Sentinel type for writes without a snapshot comparison."""
+
+
+_UNCHECKED = _UncheckedSnapshot()
+
+
+def _owner_snapshot(owner: Owner) -> dict[str, object]:
+    """Serialize an owner for persistence and snapshot comparisons."""
+    return {
         "owner_id": str(owner.owner_id),
         "name": owner.name,
         "pets": [
@@ -429,6 +452,17 @@ def save_to_json(
             for pet in owner.list_pets()
         ],
     }
+
+
+def save_to_json(
+    owner: Owner,
+    path: str | Path = DEFAULT_DATA_PATH,
+    *,
+    expected_owner: Owner | None | _UncheckedSnapshot = _UNCHECKED,
+) -> None:
+    """Save atomically. Pass an expected owner or None to check for a change."""
+    path = Path(path)
+    data = _owner_snapshot(owner)
     try:
         _restore_owner(data)
     except (AttributeError, KeyError, TypeError, ValueError) as error:
@@ -436,8 +470,14 @@ def save_to_json(
 
     with _persistence_lock:
         stored_owner = load_from_json(path)
-        if expected_owner is not None and stored_owner is not None and stored_owner != expected_owner:
-            raise ValueError("The saved data changed in another session. Reopen PawPal+ and try again.")
+        if expected_owner is not _UNCHECKED:
+            # Equal aware datetimes can still have different saved offsets and calendar dates.
+            expected = _owner_snapshot(expected_owner) if isinstance(expected_owner, Owner) else None
+            stored = _owner_snapshot(stored_owner) if stored_owner is not None else None
+            if stored != expected:
+                raise ValueError(
+                    "The saved data changed in another session or on disk. Reopen PawPal+ and try again."
+                )
 
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = None

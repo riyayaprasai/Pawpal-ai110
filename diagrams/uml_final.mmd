@@ -1,0 +1,58 @@
+classDiagram
+    class Owner {
+        +str name
+        +UUID owner_id
+        +list~Pet~ pets
+        +__post_init__() None
+        +rename(str name) None
+        +add_pet(Pet pet) None
+        +find_pet(UUID pet_id) Optional~Pet~
+        +list_pets() list~Pet~
+        +remove_pet(UUID pet_id) Optional~Pet~
+        +get_all_tasks() list~PetTask~
+    }
+
+    class Pet {
+        +str name
+        +str species
+        +UUID pet_id
+        +list~Task~ tasks
+        +__post_init__() None
+        +add_task(Task task) None
+        +list_tasks() list~Task~
+        +find_task(UUID task_id) Optional~Task~
+        +remove_task(UUID task_id) Optional~Task~
+    }
+
+    class Task {
+        +str description
+        +datetime due_at
+        +int duration_minutes
+        +UUID task_id
+        +bool completed
+        +Frequency frequency
+        +Priority priority
+        +__post_init__() None
+        +mark_complete() None
+        +to_dict() TaskData
+    }
+
+    class Scheduler {
+        +Owner owner
+        +__init__(Owner owner) None
+        +sort_by_time() list~PetTask~
+        +sort_by_priority(Optional~Iterable~PetTask~~ entries) list~PetTask~
+        +sort_chronologically() list~PetTask~
+        +filter_tasks(Optional~UUID~ pet_id, Optional~str~ pet_name, Optional~date~ due_on, Optional~bool~ completed, Optional~Priority~ priority) list~PetTask~
+        +next_occurrence_at(Task task) Optional~datetime~
+        +mark_task_complete(UUID pet_id, UUID task_id) Optional~Task~
+        +detect_conflicts() list~TaskConflict~
+        +find_next_available_slot(datetime window_start, datetime window_end, int duration_minutes) Optional~datetime~
+    }
+
+    Owner "1" *-- "0..*" Pet : contains
+    Pet "1" *-- "0..*" Task : contains
+    Scheduler "0..*" --> "1" Owner : references
+
+    note for Owner "Module-level functions in pawpal_system.py<br/>save_to_json(owner, path, *, expected_owner) returns None<br/>load_from_json(path) returns an Owner or None"
+    note for Scheduler "PetTask is a Pet and Task pair.<br/>TaskConflict is a pair of PetTask entries."

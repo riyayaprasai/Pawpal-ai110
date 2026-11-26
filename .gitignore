@@ -1,7 +1,15 @@
 __pycache__/
+*.py[cod]
 .venv/
 .venv_new/
 .pytest_cache/
 .DS_Store
+
+.env
+.env.*
+!.env.example
+!.env.sample
+.streamlit/secrets.toml
+
 /data/data.json
 /data/.data.json.*.tmp

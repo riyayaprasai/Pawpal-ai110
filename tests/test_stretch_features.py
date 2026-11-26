@@ -214,3 +214,43 @@ def test_demo_is_reproducible_and_keeps_live_data_untouched(
     assert "WARNING" in first and "Earliest start: Thu, Jan 15, 2026 08:00" in first
     assert "Restored Jordan, 2 pets, and 8 tasks with their original IDs." in first
     assert live_path.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_save_detects_a_changed_offset_even_when_the_instant_is_equal(tmp_path: Path) -> None:
+    path = tmp_path / "data.json"
+    original = Task("Feed", datetime(2026, 1, 16, 0, 30, tzinfo=timezone.utc), 20)
+    pet = Pet("Mochi", "Cat", tasks=[original])
+    owner = Owner("Jordan", pets=[pet])
+    save_to_json(owner, path)
+    previous = load_from_json(path)
+    assert previous is not None
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["pets"][0]["tasks"][0]["due_at"] = "2026-01-15T19:30:00-05:00"
+    updated = json.dumps(payload)
+    path.write_text(updated, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="saved data changed"):
+        save_to_json(Owner("Stale edit", owner_id=owner.owner_id), path, expected_owner=previous)
+
+    assert path.read_text(encoding="utf-8") == updated
+
+
+@pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+def test_invalid_json_numeric_literals_are_rejected_and_preserved(
+    tmp_path: Path, literal: str
+) -> None:
+    path = tmp_path / "data.json"
+    owner = Owner("Jordan")
+    save_to_json(owner, path)
+    malformed = path.read_text(encoding="utf-8").replace(
+        '"pets": []', f'"pets": [], "extra": {literal}'
+    )
+    path.write_text(malformed, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Invalid JSON numeric literal"):
+        load_from_json(path)
+    with pytest.raises(ValueError, match="Invalid JSON numeric literal"):
+        save_to_json(owner, path)
+
+    assert path.read_text(encoding="utf-8") == malformed

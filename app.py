@@ -2,7 +2,7 @@
 
 from collections import Counter
 from copy import deepcopy
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
 from html import escape
 from pathlib import Path
 from typing import get_args
@@ -22,12 +22,14 @@ PRIORITY_LABELS = {"High": "▲ High", "Medium": "● Medium", "Low": "▼ Low"}
 def persist_owner(candidate: Owner, message: str) -> bool:
     """Publish a changed snapshot only after its save succeeds."""
     try:
-        save_to_json(candidate, DEFAULT_DATA_PATH, expected_owner=st.session_state["owner"])
+        expected = st.session_state["owner"] if st.session_state["owner_saved"] else None
+        save_to_json(candidate, DEFAULT_DATA_PATH, expected_owner=expected)
     except (OSError, ValueError) as error:
         st.session_state["notice"] = (False, f"Change could not be saved. {error}")
         return False
 
     st.session_state["owner"] = candidate
+    st.session_state["owner_saved"] = True
     st.session_state["notice"] = (True, message)
     return True
 
@@ -80,7 +82,7 @@ def remove_pet(owner: Owner, pet_id: UUID, confirmation_key: str) -> None:
             st.session_state[selection_key] = None
 
 
-def add_task(owner: Owner, pet_id: UUID) -> None:
+def add_task(owner: Owner, pet_id: UUID, schedule_zone: timezone | None) -> None:
     """Validate and add a task to the selected registered pet."""
     candidate = deepcopy(owner)
     pet = candidate.find_pet(pet_id)
@@ -91,7 +93,9 @@ def add_task(owner: Owner, pet_id: UUID) -> None:
     try:
         task = Task(
             description=st.session_state["task_description"].strip(),
-            due_at=datetime.combine(st.session_state["task_date"], st.session_state["task_time"]),
+            due_at=datetime.combine(
+                st.session_state["task_date"], st.session_state["task_time"], tzinfo=schedule_zone
+            ),
             duration_minutes=st.session_state["task_duration"],
             frequency=st.session_state["task_frequency"],
             priority=st.session_state["task_priority"],
@@ -123,7 +127,7 @@ def complete_task(owner: Owner, pet_id: UUID, selection_key: str) -> None:
 
     message = "Task marked complete."
     if next_task is not None:
-        message += f" Next occurrence: {next_task.due_at:%b %d, %Y at %H:%M}."
+        message += f" Next occurrence: {format_schedule_datetime(next_task.due_at)}."
     if persist_owner(candidate, message):
         st.session_state[selection_key] = None
 
@@ -140,6 +144,23 @@ def pet_labels(pets: list[Pet]) -> dict[UUID, str]:
     }
 
 
+def display_datetime(value: datetime) -> datetime:
+    """Display aware schedules on a common UTC clock."""
+    return value.astimezone(timezone.utc) if value.utcoffset() is not None else value
+
+
+def format_schedule_datetime(value: datetime) -> str:
+    """Show stored precision so a suggested slot is never rounded earlier."""
+    display = display_datetime(value)
+    clock = display.strftime("%H:%M")
+    if display.second or display.microsecond:
+        clock += display.strftime(":%S")
+    if display.microsecond:
+        clock += f".{display.microsecond:06d}".rstrip("0")
+    zone = " UTC" if display.tzinfo is not None else ""
+    return f"{display:%b %d, %Y} at {clock}{zone}"
+
+
 def show_task_table(
     entries: list[PetTask], labels: dict[UUID, str], *, details: bool = False
 ) -> None:
@@ -149,7 +170,7 @@ def show_task_table(
         row = {
             "Pet": labels[pet.pet_id],
             "Task": task.description,
-            "Due": task.due_at.strftime("%b %d, %Y · %H:%M"),
+            "Due": format_schedule_datetime(task.due_at),
             "Priority": PRIORITY_LABELS[task.priority],
             "Status": "Completed" if task.completed else "Pending",
         }
@@ -160,9 +181,7 @@ def show_task_table(
     st.table(rows)
 
 
-def show_dashboard(
-    scheduler: Scheduler, entries: list[PetTask], labels: dict[UUID, str], today: date
-) -> None:
+def show_dashboard(entries: list[PetTask], labels: dict[UUID, str], today: date) -> None:
     """Show owner-wide counts and the current day's tasks."""
     completed = sum(task.completed for _, task in entries)
     pets_metric, pending_metric, completed_metric = st.columns(3)
@@ -173,7 +192,9 @@ def show_dashboard(
     with st.container(border=True):
         st.header("Today's schedule")
         st.caption(today.strftime("%A, %B %d, %Y"))
-        today_entries = scheduler.filter_tasks(due_on=today)
+        today_entries = [
+            (pet, task) for pet, task in entries if display_datetime(task.due_at).date() == today
+        ]
         if today_entries:
             show_task_table(today_entries, labels)
         elif not labels:
@@ -222,7 +243,13 @@ def show_pets(owner: Owner, pets: list[Pet], labels: dict[UUID, str]) -> None:
                 )
 
 
-def show_tasks(owner: Owner, scheduler: Scheduler, labels: dict[UUID, str], today: date) -> None:
+def show_tasks(
+    owner: Owner,
+    scheduler: Scheduler,
+    labels: dict[UUID, str],
+    today: date,
+    schedule_zone: timezone | None,
+) -> None:
     """Render task entry, the selected pet's tasks, and completion."""
     st.header("Manage tasks")
     if not labels:
@@ -250,7 +277,9 @@ def show_tasks(owner: Owner, scheduler: Scheduler, labels: dict[UUID, str], toda
             "Duration (minutes)", min_value=1, value=20, step=1, key="task_duration"
         )
         st.caption("Completing a daily or weekly task adds its next scheduled occurrence.")
-        st.form_submit_button("Add task", on_click=add_task, args=(owner, pet_id), type="primary")
+        st.form_submit_button(
+            "Add task", on_click=add_task, args=(owner, pet_id, schedule_zone), type="primary"
+        )
 
     st.subheader("Existing tasks")
     entries = scheduler.filter_tasks(pet_id=pet_id)
@@ -260,7 +289,9 @@ def show_tasks(owner: Owner, scheduler: Scheduler, labels: dict[UUID, str], toda
     show_task_table(entries, labels, details=True)
 
     pending = {
-        task.task_id: f"{task.description} · {task.due_at:%b %d, %H:%M} · {task.task_id.hex[:8]}"
+        task.task_id: (
+            f"{task.description} · {format_schedule_datetime(task.due_at)} · {task.task_id.hex[:8]}"
+        )
         for _, task in entries if not task.completed
     }
     if not pending:
@@ -305,14 +336,16 @@ def show_schedule(scheduler: Scheduler, labels: dict[UUID, str]) -> None:
             st.subheader("Scheduling conflicts")
             for (first_pet, first_task), (second_pet, second_task) in conflicts:
                 st.warning(
-                    f"{first_task.due_at:%b %d, %Y at %H:%M}: "
+                    f"{format_schedule_datetime(first_task.due_at)}: "
                     f"{labels[first_pet.pet_id]} — {first_task.description} and "
                     f"{labels[second_pet.pet_id]} — {second_task.description} "
                     "are scheduled for the same time."
                 )
 
 
-def show_slot_suggestion(scheduler: Scheduler, today: date) -> None:
+def show_slot_suggestion(
+    scheduler: Scheduler, today: date, schedule_zone: timezone | None
+) -> None:
     """Suggest a free interval without changing any tasks."""
     with st.expander("Find an available slot"):
         with st.form("find_slot"):
@@ -328,8 +361,8 @@ def show_slot_suggestion(scheduler: Scheduler, today: date) -> None:
             return
 
         try:
-            start = datetime.combine(start_date, start_time)
-            end = datetime.combine(end_date, end_time)
+            start = datetime.combine(start_date, start_time, tzinfo=schedule_zone)
+            end = datetime.combine(end_date, end_time, tzinfo=schedule_zone)
             slot = scheduler.find_next_available_slot(start, end, minutes)
         except (TypeError, ValueError) as error:
             st.warning(str(error))
@@ -338,10 +371,10 @@ def show_slot_suggestion(scheduler: Scheduler, today: date) -> None:
         if slot is None:
             st.info("No available slot fits that duration and time window.")
         else:
-            st.success(f"Earliest available start: {slot:%b %d, %Y at %H:%M} ({minutes} min).")
+            st.success(f"Earliest available start: {format_schedule_datetime(slot)} ({minutes} min).")
 
 
-def main() -> None:
+def main(*, today: date | None = None) -> None:
     """Render the dashboard and management views for this session."""
     st.set_page_config(page_title="PawPal+", page_icon="🐾", layout="wide")
     st.markdown(f"<style>{APP_CSS.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
@@ -353,7 +386,17 @@ def main() -> None:
             st.info("Restore a valid data file and reopen PawPal+.")
             st.stop()
         st.session_state["owner"] = loaded_owner if loaded_owner is not None else Owner("Jordan")
+        st.session_state["owner_saved"] = loaded_owner is not None
     owner: Owner = st.session_state["owner"]
+
+    awareness = {task.due_at.utcoffset() is not None for _, task in owner.get_all_tasks()}
+    if len(awareness) > 1:
+        st.error("The saved schedule mixes timezone-aware and timezone-naive dates.")
+        st.info("Use one date format consistently in the saved file, then reopen PawPal+.")
+        st.stop()
+    schedule_zone = timezone.utc if True in awareness else None
+    if today is None:
+        today = datetime.now(timezone.utc).date() if schedule_zone is not None else date.today()
 
     with st.sidebar:
         st.header("Pet care profile")
@@ -376,6 +419,8 @@ def main() -> None:
         """,
         unsafe_allow_html=True,
     )
+    if schedule_zone is not None:
+        st.caption("Schedule times and new entries use UTC.")
     feedback = st.empty()
     notice = st.session_state.pop("notice", None)
     if notice is not None:
@@ -389,18 +434,17 @@ def main() -> None:
     labels = pet_labels(pets)
     scheduler = Scheduler(owner)
     entries = scheduler.sort_by_time()
-    today = date.today()
 
     dashboard, pet_tab, task_tab, schedule = st.tabs(["Dashboard", "Pets", "Tasks", "Schedule"])
     with dashboard:
-        show_dashboard(scheduler, entries, labels, today)
+        show_dashboard(entries, labels, today)
     with pet_tab:
         show_pets(owner, pets, labels)
     with task_tab:
-        show_tasks(owner, scheduler, labels, today)
+        show_tasks(owner, scheduler, labels, today, schedule_zone)
     with schedule:
         show_schedule(scheduler, labels)
-        show_slot_suggestion(scheduler, today)
+        show_slot_suggestion(scheduler, today, schedule_zone)
 
 
 if __name__ == "__main__":
