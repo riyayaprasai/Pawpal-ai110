@@ -26,6 +26,7 @@ classDiagram
         +str name
         +UUID owner_id
         +list~Pet~ pets
+        +rename(str name) None
         +add_pet(Pet pet) None
         +find_pet(UUID pet_id) Optional~Pet~
         +list_pets() list~Pet~
