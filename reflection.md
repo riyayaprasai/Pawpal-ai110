@@ -10,14 +10,14 @@
 **Proposed architecture**
 
 - `Task`, `Pet`, and `Owner` are dataclasses. Each pet holds its own tasks and each owner holds their pets. `Owner.get_all_tasks()` keeps each task paired with its pet.
-- `Scheduler` reads one owner's tasks across all pets. It can sort, filter, check for overlaps, and propose a plan with reasons for its choices. Streamlit can display those results and collect input separately.
-- The draft uses the due time as the current scheduled start for overlap checks. Review whether fixed appointments need a separate start or deadline and which time zone defines the owner's calendar day.
+- `Scheduler` reads one owner's tasks across all pets. It sorts, filters, and checks for start-time conflicts. Priority-based plan proposals remain a future feature. Streamlit can display those results and collect input separately.
+- The scheduler uses the due time as the scheduled start for exact-time conflict checks. Review whether fixed appointments need a separate start or deadline and which time zone defines the owner's calendar day.
 
 **Three core workflows**
 
 1. **Set up pets and care tasks.** Create an owner, add pets, and assign feeding, walking, medication, grooming, or appointment tasks to the relevant pet. Each task records its due time, duration, frequency, and priority.
-2. **Review and plan a day.** Filter the combined schedule by pet, date, or completion status. Check for overlaps across pets, then propose a priority-based plan or look for a slot that fits within the owner's available time.
-3. **Complete a task and handle recurrence.** Mark the current task complete. For a daily or weekly task, use its scheduled due time to preview the next occurrence. A future implementation can add that occurrence to the same pet as a separate task and prevent duplicates when completion is retried.
+2. **Review and plan a day.** Filter the combined schedule by pet, date, or completion status. Check for tasks scheduled at the same time across pets. A priority-based plan or a search for an available slot could extend this workflow.
+3. **Complete a task and handle recurrence.** Mark the current task complete. For a daily or weekly task, the scheduler adds one new occurrence to the same pet based on the original due time. It keeps the completed occurrence in the task history.
 
 **b. Design changes**
 
@@ -37,6 +37,18 @@
 
 - Describe one tradeoff your scheduler makes.
 - Why is that tradeoff reasonable for this scenario?
+
+**AI recommendations to consider**
+
+- Sort the current pet-task pairs by datetime and keep their input order for ties. Apply filters in one pass before sorting the matches, which keeps filtering readable and avoids maintaining a search index.
+- Generate one successor on completion using the original scheduled time as the anchor. This keeps the intended cadence and retains the original as history. A late completion can therefore create a successor that is already overdue.
+- Group pending tasks by their exact start time and surface conflicts as warnings. This identifies simultaneous starts without preventing entry of valid care tasks.
+
+**Questions for personal review**
+
+- Should overdue routines advance one interval at a time, skip missed dates, or offer a separate way to record missed care?
+- Should the app warn about overlapping durations, or only simultaneous starts? Which pet-care activities can safely run in parallel?
+- Which time zone should define the owner's calendar day, especially when pets or caregivers travel?
 
 ---
 

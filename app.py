@@ -51,8 +51,9 @@ def remove_pet(owner: Owner, pet_id: UUID, confirmation_key: str) -> None:
         return
 
     st.session_state["remove_pet_id"] = None
-    if st.session_state.get("task_pet_id") == pet_id:
-        st.session_state["task_pet_id"] = None
+    for selection_key in ("task_pet_id", "schedule_pet_id"):
+        if st.session_state.get(selection_key) == pet_id:
+            st.session_state[selection_key] = None
     st.session_state["notice"] = (True, f"Removed {pet.name} and their tasks.")
 
 
@@ -79,22 +80,27 @@ def add_task(owner: Owner, pet_id: UUID) -> None:
         st.session_state["notice"] = (True, f"Added a task for {pet.name}.")
 
 
-def complete_task(owner: Owner, pet_id: UUID, selection_key: str) -> None:
-    """Find the selected task and mark it complete through the backend."""
+def complete_task(scheduler: Scheduler, pet_id: UUID, selection_key: str) -> None:
+    """Complete the selected occurrence through the scheduler."""
     task_id = st.session_state[selection_key]
     if task_id is None:
         st.session_state["notice"] = (False, "Choose a pending task to mark complete.")
         return
 
-    pet = owner.find_pet(pet_id)
-    task = pet.find_task(task_id) if pet is not None else None
-    if task is None:
-        st.session_state["notice"] = (False, "This task is no longer available.")
+    try:
+        next_task = scheduler.mark_task_complete(pet_id, task_id)
+    except ValueError as error:
+        st.session_state["notice"] = (False, str(error))
+        return
+    except OverflowError:
+        st.session_state["notice"] = (False, "The next occurrence is outside the supported date range.")
         return
 
-    task.mark_complete()
     st.session_state[selection_key] = None
-    st.session_state["notice"] = (True, f"Completed {task.description}.")
+    message = "Task marked complete."
+    if next_task is not None:
+        message += f" Next occurrence: {next_task.due_at:%b %d, %Y at %H:%M}."
+    st.session_state["notice"] = (True, message)
 
 
 def pet_labels(pets: list[Pet]) -> dict[UUID, str]:
@@ -218,7 +224,7 @@ def show_tasks(owner: Owner, scheduler: Scheduler, labels: dict[UUID, str], toda
         duration_col.number_input(
             "Duration (minutes)", min_value=1, value=20, step=1, key="task_duration"
         )
-        st.caption("Frequency is saved with the task. Add future occurrences as separate tasks.")
+        st.caption("Completing a daily or weekly task adds its next scheduled occurrence.")
         st.form_submit_button("Add task", on_click=add_task, args=(owner, pet_id), type="primary")
 
     st.subheader("Existing tasks")
@@ -242,8 +248,40 @@ def show_tasks(owner: Owner, scheduler: Scheduler, labels: dict[UUID, str], toda
             key=selection_key,
         )
         st.form_submit_button(
-            "Mark complete", on_click=complete_task, args=(owner, pet_id, selection_key)
+            "Mark complete", on_click=complete_task, args=(scheduler, pet_id, selection_key)
         )
+
+
+def show_schedule(scheduler: Scheduler, labels: dict[UUID, str]) -> None:
+    """Render filtered rows and warn about conflicts across the full schedule."""
+    with st.container(border=True):
+        st.header("Scheduled tasks")
+        pet_column, status_column = st.columns(2)
+        pet_id = pet_column.selectbox(
+            "Filter by pet", list(labels), index=None, format_func=labels.__getitem__,
+            placeholder="All pets", disabled=not labels, key="schedule_pet_id",
+        )
+        statuses = {"All statuses": None, "Pending": False, "Completed": True}
+        status = status_column.selectbox("Completion status", list(statuses))
+
+        entries = scheduler.filter_tasks(pet_id=pet_id, completed=statuses[status])
+        if entries:
+            show_task_table(entries, labels)
+        elif pet_id is None and status == "All statuses":
+            st.info("The schedule is empty. Add a care task to get started.")
+        else:
+            st.info("No tasks match these filters.")
+
+        conflicts = scheduler.detect_conflicts()
+        if conflicts:
+            st.subheader("Scheduling conflicts")
+            for (first_pet, first_task), (second_pet, second_task) in conflicts:
+                st.warning(
+                    f"{first_task.due_at:%b %d, %Y at %H:%M}: "
+                    f"{labels[first_pet.pet_id]} — {first_task.description} and "
+                    f"{labels[second_pet.pet_id]} — {second_task.description} "
+                    "are scheduled for the same time."
+                )
 
 
 def main() -> None:
@@ -287,7 +325,7 @@ def main() -> None:
     pets = owner.list_pets()
     labels = pet_labels(pets)
     scheduler = Scheduler(owner)
-    entries = scheduler.sort_chronologically()
+    entries = scheduler.sort_by_time()
     today = date.today()
 
     dashboard, pet_tab, task_tab, schedule = st.tabs(["Dashboard", "Pets", "Tasks", "Schedule"])
@@ -298,12 +336,7 @@ def main() -> None:
     with task_tab:
         show_tasks(owner, scheduler, labels, today)
     with schedule:
-        with st.container(border=True):
-            st.header("All scheduled tasks")
-            if entries:
-                show_task_table(entries, labels)
-            else:
-                st.info("The schedule is empty. Add a care task to get started.")
+        show_schedule(scheduler, labels)
 
 
 if __name__ == "__main__":

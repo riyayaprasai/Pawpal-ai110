@@ -1,13 +1,17 @@
 """PawPal+ domain entities and owner-wide scheduling."""
 
-from dataclasses import dataclass, field
-from datetime import date, datetime
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime, timedelta, timezone
+from itertools import combinations
+from threading import Lock
 from typing import Literal, get_args
 from uuid import UUID, uuid4
 
 Frequency = Literal["once", "daily", "weekly"]
 Priority = Literal["Low", "Medium", "High"]
 TaskData = dict[str, str | int | bool]
+
+_completion_lock = Lock()
 
 
 def _require_nonblank(value: str, field_name: str) -> None:
@@ -173,53 +177,91 @@ TaskConflict = tuple[PetTask, PetTask]
 PlannedTask = tuple[PetTask, datetime, str]  # Pair, proposed start, explanation.
 
 
-class Scheduler:
-    """Plan across an owner's pets using their task lists as the source of truth.
+def _due_time_key(entry: PetTask) -> datetime:
+    """Use an absolute clock for aware datetimes and preserve local naive times."""
+    due_at = entry[1].due_at
+    if due_at.utcoffset() is not None:
+        return due_at.astimezone(timezone.utc)
+    return due_at
 
-    Collection queries return lists, empty when there are no results. Tasks
-    are always paired with their pet. Single-time queries return a datetime
-    or None. Scheduling methods leave the owner's task records untouched.
-    """
+
+class Scheduler:
+    """Read and update the owner's current schedule without storing a copy."""
 
     owner: Owner
 
     def __init__(self, owner: Owner) -> None:
         self.owner = owner
 
+    def sort_by_time(self) -> list[PetTask]:
+        """Return pet-task pairs by due time, preserving insertion order for ties."""
+        return sorted(self.owner.get_all_tasks(), key=_due_time_key)
+
     def sort_chronologically(self) -> list[PetTask]:
-        """Return current pet-task pairs ordered by comparable due times."""
-        return sorted(self.owner.get_all_tasks(), key=lambda pair: pair[1].due_at)
+        """Return the chronological schedule through the original method name."""
+        return self.sort_by_time()
 
     def filter_tasks(
         self,
         *,
         pet_id: UUID | None = None,
+        pet_name: str | None = None,
         due_on: date | None = None,
         completed: bool | None = None,
+        priority: Priority | None = None,
     ) -> list[PetTask]:
-        """Return pairs matching all supplied filters in chronological order."""
-        return [
+        """Return sorted pairs matching every supplied filter."""
+        name = pet_name.strip().casefold() if pet_name is not None else None
+        matches = [
             (pet, task)
-            for pet, task in self.sort_chronologically()
+            for pet, task in self.owner.get_all_tasks()
             if (pet_id is None or pet.pet_id == pet_id)
+            and (name is None or pet.name.strip().casefold() == name)
             and (due_on is None or task.due_at.date() == due_on)
             and (completed is None or task.completed == completed)
+            and (priority is None or task.priority == priority)
         ]
-
-    def detect_conflicts(self) -> list[TaskConflict]:
-        """Return each overlapping pair of pending tasks once, across all pets.
-
-        Use due_at as the current start and duration_minutes to find the end.
-        Tasks may touch at an endpoint without overlapping.
-        """
-        raise NotImplementedError
+        return sorted(matches, key=_due_time_key)
 
     def next_occurrence_at(self, task: Task) -> datetime | None:
-        """Return the next daily or weekly due time from this task's due time.
+        """Advance the original due time by one interval, even if overdue."""
+        if task.frequency == "once":
+            return None
+        days = 1 if task.frequency == "daily" else 7
+        return task.due_at + timedelta(days=days)
 
-        Return None for a one-time task.
-        """
-        raise NotImplementedError
+    def mark_task_complete(self, pet_id: UUID, task_id: UUID) -> Task | None:
+        """Complete an occurrence and return its new successor, if one was added."""
+        # A new Scheduler can refer to the same owner on any rerun.
+        with _completion_lock:
+            pet = self.owner.find_pet(pet_id)
+            if pet is None:
+                raise ValueError("This pet is no longer registered.")
+            task = pet.find_task(task_id)
+            if task is None:
+                raise ValueError("This task is no longer available.")
+            if task.completed:
+                return None
+
+            next_due = self.next_occurrence_at(task)
+            next_task = None
+            if next_due is not None:
+                next_task = replace(task, due_at=next_due, task_id=uuid4(), completed=False)
+                pet.add_task(next_task)
+            task.mark_complete()
+            return next_task
+
+    def detect_conflicts(self) -> list[TaskConflict]:
+        """Pair pending tasks with exactly the same due datetime."""
+        tasks_by_time: dict[datetime, list[PetTask]] = {}
+        for entry in self.owner.get_all_tasks():
+            if not entry[1].completed:
+                tasks_by_time.setdefault(_due_time_key(entry), []).append(entry)
+        return [
+            pair
+            for entries in tasks_by_time.values()
+            for pair in combinations(entries, 2)
+        ]
 
     def plan_by_priority(
         self, window_start: datetime, window_end: datetime
